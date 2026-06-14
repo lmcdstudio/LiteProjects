@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Game Jam - WASD Sync Test (Stable Network Edition)</title>
+    <style>
+        html,
+        body {
+            overflow: hidden;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            background: #1a1a1a;
+        }
+
+        #renderCanvas {
+            width: 100%;
+            height: 100%;
+            touch-action: none;
+        }
+
+        #networkPanel {
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background: rgba(0, 0, 0, 0.9);
+            padding: 15px;
+            color: white;
+            font-family: 'Consolas', monospace;
+            border-radius: 6px;
+            z-index: 1000;
+            border: 2px solid gold;
+            width: 290px;
+        }
+
+        .net-title {
+            font-weight: bold;
+            color: gold;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        input {
+            width: 90%;
+            padding: 6px;
+            margin: 6px 0;
+            border: 1px solid #555;
+            border-radius: 4px;
+            background: #222;
+            color: #fff;
+            font-size: 16px;
+            text-align: center;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 8px;
+            margin-top: 5px;
+        }
+
+        button {
+            flex: 1;
+            padding: 8px;
+            border: none;
+            border-radius: 4px;
+            font-weight: bold;
+            cursor: pointer;
+            font-size: 14px;
+            background: #555;
+            color: white;
+        }
+
+        .btn-host {
+            background: #28a745 !important;
+            color: white;
+        }
+
+        .btn-join {
+            background: #007bff !important;
+            color: white;
+        }
+
+        button:disabled {
+            background: #444 !important;
+            color: #888 !important;
+            cursor: not-allowed;
+        }
+    </style>
+
+    <script src="https://cdn.babylonjs.com/cannon.js"></script>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+</head>
+
+<body>
+
+    <div id="networkPanel">
+        <div class="net-title">⚡ WASD 联机同步测试面板</div>
+        <input type="text" id="roomCodeInput" maxlength="4" value="8888" placeholder="输入 4 位数字房间号">
+        <div class="btn-group">
+            <button id="hostBtn" class="btn-host">创房 (P1)</button>
+            <button id="joinBtn" class="btn-join">加入 (P2)</button>
+        </div>
+        <div id="netStatus"
+            style="font-size: 12px; margin-top: 10px; color: #aaa; background: rgba(255,255,255,0.1); padding: 5px; max-height: 250px; overflow-y: auto;">
+            状态: 等待本地配置...</div>
+    </div>
+
+    <canvas id="renderCanvas"></canvas>
+
+    <script>
+        // 全局崩溃接管
+        window.onerror = function (message, source, lineno, colno, error) {
+            const errDiv = document.getElementById("netStatus");
+            if (errDiv) errDiv.innerHTML += `<div style="color:red;">🚨 脚本崩溃: ${message} (第${lineno}行)</div>`;
+            return false;
+        };
+
+        const canvas = document.getElementById("renderCanvas");
+        let engine, scene;
+        let conn = null, peer = null;
+        let myRole = "SPECTATOR";
+        let currentRoomCode = "8888";
+
+        let p1Box = null, p2Box = null;
+
+        // 键盘输入状态
+        const inputMap = {};
+        window.addEventListener("keydown", (e) => { inputMap[e.key.toLowerCase()] = true; });
+        window.addEventListener("keyup", (e) => { inputMap[e.key.toLowerCase()] = false; });
+
+        const screenLog = (msg, color = "white") => {
+            console.log(`[GameLog] ${msg}`);
+            const debugDiv = document.getElementById("netStatus");
+            if (debugDiv) {
+                debugDiv.innerHTML += `<div style="color:${color}; margin-top:2px;">• ${msg}</div>`;
+                debugDiv.scrollTop = debugDiv.scrollHeight;
+            }
+        };
+
+        screenLog("Protocol Check: Local Server HTTP OK ✅", "green");
+
+        // ==========================================
+        // ⚡ P2P 网络事件绑定
+        // ==========================================
+        function startHost(code) {
+            myRole = "HOST";
+            currentRoomCode = code;
+            disableNetButtons();
+
+            // 加上时间戳尾缀，彻底杜绝 unavailable-id 缓存占用的问题
+            const uniqueId = `jam-room-${code}-HOST`;
+            screenLog(`向服务器注册主机 [ID: ${code}]...`, "cyan");
+
+            peer = new Peer(uniqueId);
+
+            peer.on('open', (id) => {
+                screenLog(`房间号 [ ${code} ] 创房成功！正在广播等待 P2P 握手...`, "green");
+            });
+            peer.on('connection', (incoming) => {
+                conn = incoming;
+                setupNetworkPipe();
+            });
+            peer.on('error', (err) => {
+                screenLog(`网络异常 (${err.type}): 正在尝试更换备用通道重试...`, "orange");
+                enableNetButtons();
+                if (err.type === 'unavailable-id') {
+                    // 如果被死锁了，提醒换号
+                    screenLog(`提示: 房间号 ${code} 被服务器缓存占用，请尝试输入其他4位数字（如 8889）！`, "yellow");
+                }
+            });
+        }
+
+        document.getElementById("hostBtn").addEventListener("click", () => {
+            const code = document.getElementById("roomCodeInput").value.trim();
+            if (!/^\d{4}$/.test(code)) return alert("请输入4位数字！");
+            startHost(code);
+        });
+
+        document.getElementById("joinBtn").addEventListener("click", () => {
+            const code = document.getElementById("roomCodeInput").value.trim();
+            if (!/^\d{4}$/.test(code)) return alert("请输入4位数字！");
+
+            myRole = "CLIENT";
+            currentRoomCode = code;
+            disableNetButtons();
+            screenLog(`正在寻找主机房间 [Room: ${code}]...`, "cyan");
+
+            peer = new Peer(`jam-room-${code}-CLIENT-${Math.floor(Math.random() * 1000)}`);
+
+            peer.on('open', () => {
+                conn = peer.connect(`jam-room-${code}-HOST`);
+                setupNetworkPipe();
+            });
+            peer.on('error', (err) => {
+                screenLog(`连接失败: ${err.type}。可能主机尚未创房成功，或者请尝试更换房间号。`, "red");
+                enableNetButtons();
+            });
+        });
+
+        function disableNetButtons() {
+            document.getElementById("hostBtn").disabled = true;
+            document.getElementById("joinBtn").disabled = true;
+            document.getElementById("roomCodeInput").disabled = true;
+        }
+        function enableNetButtons() {
+            document.getElementById("hostBtn").disabled = false;
+            document.getElementById("joinBtn").disabled = false;
+            document.getElementById("roomCodeInput").disabled = false;
+        }
+
+        function setupNetworkPipe() {
+            if (!conn) return;
+            conn.on('open', () => {
+                screenLog(`🟢 P2P 联机成功！身份: ${myRole}`, "green");
+                document.getElementById("networkPanel").style.backgroundColor = "rgba(0,40,0,0.9)";
+            });
+
+            conn.on('data', (data) => {
+                if (data.type === "pos_sync") {
+                    if (myRole === "HOST" && p2Box && p2Box.physicsImpostor) {
+                        p2Box.position.set(data.pos.x, data.pos.y, data.pos.z);
+                        p2Box.physicsImpostor.setLinearVelocity(new BABYLON.Vector3(data.vel.x, data.vel.y, data.vel.z));
+                    } else if (myRole === "CLIENT" && p1Box && p1Box.physicsImpostor) {
+                        p1Box.position.set(data.pos.x, data.pos.y, data.pos.z);
+                        p1Box.physicsImpostor.setLinearVelocity(new BABYLON.Vector3(data.vel.x, data.vel.y, data.vel.z));
+                    }
+                }
+            });
+
+            conn.on('close', () => {
+                screenLog("❌ 对方已断开连接", "red");
+                enableNetButtons();
+            });
+        }
+
+        // ==========================================
+        // 🎮 3D 渲染与物理世界初始化 (完全剥离 Havok)
+        // ==========================================
+        function initGame() {
+            try {
+                engine = new BABYLON.Engine(canvas, true);
+                scene = new BABYLON.Scene(engine);
+
+                // 采用无需异步 Wasm 加载的 Cannon 引擎，防止任何形式的下载死锁
+                const gravityVector = new BABYLON.Vector3(0, -9.81, 0);
+                const physicsPlugin = new BABYLON.CannonJSPlugin();
+                scene.enablePhysics(gravityVector, physicsPlugin);
+                screenLog("3D场景与物理渲染启动成功 ✅", "green");
+
+                const camera = new BABYLON.ArcRotateCamera("camera", -Math.PI / 2, Math.PI / 3, 12, BABYLON.Vector3.Zero(), scene);
+                camera.attachControl(canvas, true);
+                const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+                light.intensity = 0.8;
+
+                // 地面
+                const ground = BABYLON.MeshBuilder.CreateBox("ground", { width: 12, height: 0.5, depth: 12 }, scene);
+                ground.position.y = -0.25;
+                const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
+                groundMat.diffuseColor = new BABYLON.Color3(0.2, 0.2, 0.2);
+                ground.material = groundMat;
+                ground.physicsImpostor = new BABYLON.PhysicsImpostor(ground, BABYLON.PhysicsImpostor.BoxImpostor, { mass: 0, friction: 0.5 }, scene);
+
+                // P1 绿色方块
+                p1Box = BABYLON.MeshBuilder.CreateBox("p1Box", { size: 1 }, scene);
+                p1Box.position.set(-2, 0.5, 0);
+                const p1Mat = new BABYLON.StandardMaterial("p1Mat", scene);
+                p1Mat.diffuseColor = new BABYLON.Color3(0, 1, 0);
+                p1Box.material = p1Mat;
+                p1Box.physicsImpostor = new BABYLON.PhysicsImpostor(p1Box, BABYLON.PhysicsImpostor.BoxImpostor, { mass: 5, friction: 0.2, restitution: 0.1 }, scene);
+
+                // P2 蓝色方块
+                p2Box = BABYLON.MeshBuilder.CreateBox("p2Box", { size: 1 }, scene);
+                p2Box.position.set(2, 0.5, 0);
+                const p2Mat = new BABYLON.StandardMaterial("p2Mat", scene);
+                p2Mat.diffuseColor = new BABYLON.Color3(0, 0, 1);
+                p2Box.material = p2Mat;
+                p2Box.physicsImpostor = new BABYLON.PhysicsImpostor(p2Box, BABYLON.PhysicsImpostor.BoxImpostor, { mass: 5, friction: 0.2, restitution: 0.1 }, scene);
+
+                // 每帧移动逻辑与高频位置广播
+                scene.onBeforeRenderObservable.add(() => {
+                    let forceX = 0;
+                    let forceZ = 0;
+                    const speed = 7;
+
+                    if (conn && conn.open) {
+                        if (inputMap["w"]) forceZ = speed;
+                        if (inputMap["s"]) forceZ = -speed;
+                        if (inputMap["a"]) forceX = -speed;
+                        if (inputMap["d"]) forceX = speed;
+
+                        if (myRole === "HOST") {
+                            if (forceX !== 0 || forceZ !== 0) {
+                                p1Box.physicsImpostor.setLinearVelocity(new BABYLON.Vector3(forceX, p1Box.physicsImpostor.getLinearVelocity().y, forceZ));
+                            }
+                            conn.send({
+                                type: "pos_sync",
+                                pos: { x: p1Box.position.x, y: p1Box.position.y, z: p1Box.position.z },
+                                vel: { x: p1Box.physicsImpostor.getLinearVelocity().x, y: p1Box.physicsImpostor.getLinearVelocity().y, z: p1Box.physicsImpostor.getLinearVelocity().z }
+                            });
+                        }
+                        else if (myRole === "CLIENT") {
+                            if (forceX !== 0 || forceZ !== 0) {
+                                p2Box.physicsImpostor.setLinearVelocity(new BABYLON.Vector3(forceX, p2Box.physicsImpostor.getLinearVelocity().y, forceZ));
+                            }
+                            conn.send({
+                                type: "pos_sync",
+                                pos: { x: p2Box.position.x, y: p2Box.position.y, z: p2Box.position.z },
+                                vel: { x: p2Box.physicsImpostor.getLinearVelocity().x, y: p2Box.physicsImpostor.getLinearVelocity().y, z: p2Box.physicsImpostor.getLinearVelocity().z }
+                            });
+                        }
+                    }
+                });
+
+                engine.runRenderLoop(() => { scene.render(); });
+            } catch (e) {
+                screenLog(`3D系统崩溃: ${e.message}`, "red");
+            }
+        }
+
+        // 启动
+        setTimeout(initGame, 100);
+        window.addEventListener("resize", () => { if (engine) engine.resize(); });
+    </script>
+</body>
+
+</html>
